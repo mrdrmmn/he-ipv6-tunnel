@@ -1,0 +1,318 @@
+#! /bin/sh
+#
+# program:     he-ipv6-tunnel
+# description: A script used to keep an ipv6 tunnel provided by
+#              hurricane electric up and running.  It will constantly
+#              use a tiny amount of bandwidth to monitor the tunnel
+#              and restore it if it becomes broken.
+
+# Set up some defaults
+log_level=2;
+log_dest="console";
+log_timestamp=1;
+syslog_facility='user';
+syslog_priority='notice';
+username='';
+password='';
+tunnel_id='';
+tunnel_if='he-ipv6';
+public_ipv4='';
+client_ipv4='';
+client_ipv6='';
+server_ipv4='';
+server_ipv6='';
+kernel_modules='';
+frequency=5;
+max_latency=1;
+backoff=0;
+max_backoff=900;
+daemon=1;
+script=`readlink -f "$0"`;
+program=`basename "${script}"`;
+bin_dir=`dirname "${script}"`;
+prefix=`dirname "${bin_dir}"`;
+etc_dir="${prefix}/etc";
+run_dir="${prefix}/var/run";
+pid_file="${run_dir}/${program}.pid";
+conf_file="${etc_dir}/${program}.conf";
+state_file="${run_dir}/${program}.state";
+log_file="${prefix}/var/log/${program}.log";
+
+# Function to display usage.
+help() {
+cat << __END_OF_HELP__;
+Usage: $0 [OPTION]...
+Initialize and maintain an IPv6 tunnel provided by Hurricane Electric.  You can
+register for free at http://tunnelbroker.net
+
+Mandatory arguments to long options are mandatory for short options too.
+  -c, --config=FILE          use this config file
+  -d, --daemon               run as a daemon
+  -F, --no-daemon            do not run as a daemon
+  -h, --help                 display this information and exit
+  -v, --log-level=INT        set the log level (0=silent - 9=most verbose)
+
+__END_OF_HELP__
+}
+
+# Function to clean the 's off of the option values.
+clean_value() {
+  IFS="'"; set -- ${1}; IFS="${IFS_default}";
+  result="${2}";
+  while [ "${#}" -ge '3' ]; do
+    result="${result}'${3}";
+    shift;
+  done;
+  echo "${result}";
+}
+
+# Parse command line options.
+set -- `getopt --name "${program}" --options c:dFhv: \
+               --longoptions config:,daemon,no-daemon,help,log-level: -- $*`;
+while [ "${#}" -gt '0' ]; do
+  opt="${1}"; shift;
+  case "${opt}" in
+    -f|--config)
+      conf_file=`clean_value ${1}`; shift;
+    ;;
+    -d|--daemon)
+      daemon=1;
+    ;;
+    -F|--no-daemon)
+      daemon=0;
+    ;;
+    -h|--help)
+      help; exit 1;
+    ;;
+    -v|log-level)
+      log_level=`clean_value ${1}`; shift;
+    ;;
+    --)
+      break;
+    ;;
+    *)  
+      echo "OTHER: ${opt}";
+    ;;
+  esac;
+done;
+
+
+# Set up some stuff for dealing with IFS more easily.
+space=" ";
+tab="	";
+newline="
+";
+IFS_default="${space}${tab}${newline}";
+IFS="${IFS_default}";
+
+log() {
+  level="${1}"; shift;
+  message="${*}";
+  if [ "${level}" -le "${log_level}" ]; then
+    case "${log_dest}" in
+      'syslog')
+        logger --priority "${syslog_facility}.${syslog_priority}" --tag "${program}" "${message}" >/dev/null 2>&1;
+        if [ "${?}" != '0' ]; then
+          echo "FATAL: failed to send message to syslog" 1>&2;
+        fi;
+      ;;
+      *)
+        # Generate a timestamp for the message if needed.
+        timestamp='';
+        if [ "${log_timestamp}" = '1' ]; then
+          timestamp=`date +'%b %d %T'`' ';
+        fi;
+
+        case "${log_dest}" in
+          'file')
+            echo "${timestamp}${message}" >> "${log_file}" 2>/dev/null;
+            if [ "$?" != '0' ]; then
+              echo "${timestamp}FATAL: could not write to log file ${log_file}" 1>&2;
+              exit 1;
+            fi;
+          ;;
+          *)
+            # Any unknown log_dest will be treated as 'console'.
+            echo "${timestamp}${message}" 1>&2;
+          ;;
+        esac;
+      ;;
+    esac;
+  fi;
+}
+
+# Load config file.
+log 5 "loading config file: '${conf_file}'";
+if [ -f "${conf_file}" ]; then
+  . "${conf_file}";
+fi;
+
+# Make sure a copy is not already running.
+log 7 "making sure another instance of ${program} is not running"
+if [ -f "${pid_file}" ]; then
+  log 9 "reading contents of pid file: '${pid_file}'";
+  pid=`cat "${pid_file}" 2>/dev/null`;
+  if [ "${?}" = '0' ]; then
+    log 9 "checking process table for an instance of ${program} running as pid ${pid}";
+    process_name=`ps --no-headers --format comm --pid "${pid}" 2>/dev/null`;
+    if [ "${?}" = '0' ]; then
+      if [ "${process_name}" = "${program}" -a "${pid}" -ne "${$}" ]; then
+        log 1 "FATAL: another instance of ${program} is already running as pid ${pid}";
+        exit 1;
+      fi;
+      log 9 "found instance of ${process_name} running as pid ${pid}";
+    fi;
+  fi;
+fi;
+
+( while :; do
+  # Check and see if we should backoff a bit.
+  if [ "${backoff}" -gt "0" ]; then
+    log 7 "backing off for ${backoff} seconds";
+    sleep "${backoff}";
+  fi;
+
+  # Make sure the IPv6 tunnel is functioning.
+  IFS="/"; set -- ${server_ipv6}; IFS="${IFS_default}";
+  log 9 "checking ipv6 connectivity by pinging server (${1})";
+  if ! ping6 -W "${max_latency}" -c 1 "${1}" >/dev/null 2>&1; then
+    log 2 "ipv6 down: ${1} did not respond in less than ${max_latency} seconds"
+
+    # We don't want to try tunnel rebuilds too rapidly, so we need a backoff
+    if [ "${backoff}" -le "0" ]; then
+      backoff="${frequency}";
+    else
+      backoff=`expr "${backoff}" + "${backoff}" 2>/dev/null`;
+      if [ "${backoff}" -gt "${max_backoff}" ]; then
+        backoff="${max_backoff}";
+      fi;
+    fi;
+
+    # If not, check IPv4 connectivity.  If it is down, there is no reason
+    # to do anything else right now.
+    log 9 "checking ipv4 connectivity by pinging server (${server_ipv4})";
+    if ! ping -W "${max_latency}" -c 1 "${server_ipv4}" >/dev/null 2>&1; then
+      log 3 "ipv4 down: ${server_ipv4} did not responds in less than ${max_latency} seconds"
+      # If our IPv4 connection is down, we don't need to worry about increasing
+      # our backoff value.
+      backoff="${frequency}";
+      continue;
+    fi;
+
+    # Reload our conf file to make sure we have the current settings.
+    log 5 "reloading config file: '${conf_file}'";
+    if [ -f "${conf_file}" ]; then
+      . "${conf_file}";
+    fi;
+
+    # Load any needed kernel modules if they are not already loaded.
+    if [ -n "${kernel_modules}" ]; then
+      set -- ${kernel_modules};
+      for kernel_module in ${kernel_modules}; do
+        log 9 "checking to see if kernel module '${kernel_module}' is loaded"
+        if ! lsmod | grep '^'"${kernel_module}"' ' >/dev/null 2>&1; then
+          log 5 "loading kernel module '${kernel_module}'"
+          # If we cannot load our kernel modules, we have a major problem.
+          if ! modprobe "${kernel_module}"; then
+            log "FATAL: failed to load kernel module '${kernel_module}'";
+            exit 1;
+          fi;
+        fi;
+      done;
+    fi;
+
+    # Configure the tunnel if needed.
+    log 9 "checking tunnel ipv4 settings (${tunnel_if})";
+    set -- `ip tunnel show "${tunnel_if}"`;
+    current_server_ipv4="$4";
+    current_client_ipv4="$6";
+    if [ "$#" -eq "0" ]; then
+      log 5 "configuring tunnel ipv4 settings (${tunnel_if})";
+      ip tunnel add "${tunnel_if}" mode sit remote "${server_ipv4}" local "${client_ipv4}" ttl 255
+    elif [ "${current_server_ipv4}" != "${server_ipv4}" -o \
+           "${current_client_ipv4}" != "${client_ipv4}" ]; then
+      log 5 "updating tunnel configuration (${tunnel_if})";
+      ip tunnel change "${tunnel_if}" mode sit remote "${server_ipv4}" local "${client_ipv4}" ttl 255
+    fi;
+
+    # Bring up the tunnel if needed.
+    log 9 "checking tunnel status (${tunnel_if})";
+    set -- `ip link show dev "${tunnel_if}"`;
+    current_status="$9";
+    if [ "${current_status}" = "DOWN" ]; then
+      log 5 "setting tunnel status to 'UP' (${tunnel_if})";
+      ip link set he-ipv6 up
+    fi;
+
+    # Make sure the IPv6 settings are correct for the tunnel interface.
+    log 9 "checking tunnel ipv6 settings (${tunnel_if})";
+    set -- `ip -f inet6 addr show dev "${tunnel_if}" scope global`;
+    current_client_ipv6="$7";
+    if [ "${current_client_ipv6}" != "${client_ipv6}" ]; then
+      if [ "$#" -ne "0" ]; then
+        ip addr flush dev "${tunnel_if}";
+      fi;
+      log 5 "configuring tunnel ipv6 settings (${tunnel_if})";
+      ip addr add "${client_ipv6}" dev "${tunnel_if}";
+    fi;
+
+    # Make sure we have our default route set properly.
+    log 9 "checking tunnel ipv6 route (${tunnel_if})";
+    set -- `ip -f inet6 route show default`;
+    current_if="$3";
+    if [ "${current_if}" != "${tunnel_if}" ]; then
+      if [ "$#" -ne "0" ]; then
+        ip -f inet6 route flush default;
+      fi;
+      log 5 "configuring tunnel ipv6 route (${tunnel_if})";
+      ip -f inet6 route add default dev "${tunnel_if}";
+    fi;
+
+    # If the IPv6 tunnel still is not functioning, update our ip address w/
+    # Hurricane Electric to make sure their end is setup correctly.
+    IFS="/"; set -- ${server_ipv6}; IFS="${IFS_default}";
+    log 9 "rechecking ipv6 connectivity by pinging server (${1})";
+    if ! ping6 -W "${max_latency}" -c 1 "${1}" >/dev/null 2>&1; then
+      log 2 "updating server side configuration";
+      message=`curl --user "${username}:${password}" "https://ipv4.tunnelbroker.net/ipv4_end.php?tid=${tunnel_id}" 2>&1`
+      if [ "${?}" == "0" ]; then
+        log 2 'server successfully contacted';
+      else
+        log 2 'failed to contact server';
+      fi;
+      log 3 $message;
+      continue;
+    fi;
+
+    # If we make it to this point, everything is working and there is no need
+    # to backoff.
+    backoff='0';
+    log 1 'ipv6 tunnel is functional';
+  fi;
+
+  if [ "${daemon}" != '1' ]; then
+    exit 0;
+  fi;
+
+  # If we get this far, we should no longer need to have a backoff set.
+  backoff=0;
+
+  # But we still need to sleep for the expected duration.
+  log 9 "waiting for ${frequency} seconds between checks";
+  sleep "${frequency}";
+done; ) &
+
+pid="${!}";
+
+log 9 "creating pid file: '${pid_file}'";
+if ! echo "${pid}" > "${pid_file}" 2>/dev/null; then
+  log 1 "failed to create pid file: '${pid_file}'";
+  kill -KILL "${!}";
+  exit 1;
+fi;
+
+if [ "${daemon}" != '1' ]; then
+  wait "${pid}";
+else
+  log 5 "process has been daemonized"
+fi;
